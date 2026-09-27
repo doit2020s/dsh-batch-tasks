@@ -1,16 +1,13 @@
-import { join } from 'node:path';
-import { BatchQueue } from './queue.js';
-import { Store } from './store.js';
-import { locateRuntime, prepareProfile } from './runtime.js';
-import { createSdkWorker } from './worker.js';
+import { createBatchCore } from './core.js';
+import { attachWithHost } from './desktop-bridge.js';
+import { rehomeStoredSession, retireOriginalSession } from './workspace-repair.js';
 
 export const name = 'batch-tasks';
-export const inject = ['connection', 'agentDefaultModel', 'agentPresets'];
+export const inject = ['connection', 'workspaceRegistry', 'sessionPersistence', 'sessionProjections', 'sessionProjectionCache', 'storageDomain', 'agentDefaultModel', 'agentPresets'];
+export const METHODS = ['snapshot', 'defaults', 'start', 'pause', 'resume', 'concurrency', 'clear', 'ackInbox', 'setAffix', 'setPrefs', 'stopAll', 'forceAll', 'stopOne', 'forceOne', 'repairWorkspace'];
 
-// Exact Connection routes inherit the same authentication and Host/Origin fence
-// as DSH's own /api endpoints, including desktop transport adapters.
 function registerRpc(ctx, handler) {
-  for (const method of ['snapshot', 'defaults', 'start', 'pause', 'resume', 'concurrency', 'clear', 'stopAll', 'forceAll', 'stopOne', 'forceOne']) {
+  for (const method of METHODS) {
     ctx.connection.fetch.register({
       path: `/api/batch-tasks/${method}`, methods: ['POST'], requestBody: 'buffered',
       fetch: async request => {
@@ -21,49 +18,40 @@ function registerRpc(ctx, handler) {
           envelope = JSON.parse(text);
           if (envelope.type !== 'client-request' || typeof envelope.rpcId !== 'string' || envelope.method !== `batch-tasks/${method}`) throw new Error('Invalid RPC envelope');
         } catch { return new Response('Invalid request', { status: 400 }); }
-        return Response.json({ type: 'server-response', rpcId: envelope.rpcId, result: await handler(method, envelope.payload) });
+        let result;
+        try { result = await handler(method, envelope.payload); }
+        catch (e) { result = { ok: false, error: { code: 'batch/operation-failed', message: e?.message || String(e), details: {} } }; }
+        try { return Response.json({ type: 'server-response', rpcId: envelope.rpcId, result }); }
+        catch (e) { return Response.json({ type: 'server-response', rpcId: envelope.rpcId, result: { ok: false, error: { code: 'batch/invalid-response', message: e?.message || String(e), details: {} } } }); }
       },
     });
   }
 }
 
-/** Cordis lifecycle owns the route, queue lock, timers and every child process. */
+/** Host services own workspace updates; the task workers own execution. */
 export async function apply(ctx, config = {}) {
-  let runtime, startupError;
-  try { runtime = locateRuntime(config); } catch (e) { startupError = e.message; }
-  if (!runtime) {
-    registerRpc(ctx, async () => ({ ok: false, error: { code: 'batch/runtime', message: startupError, details: {} } }));
+  let core;
+  try {
+    core = await createBatchCore(config, {
+      attachSession: payload => attachWithHost(ctx, payload),
+      rehomeSession: payload => rehomeStoredSession(ctx, payload),
+      retireOriginalSession: payload => retireOriginalSession(ctx, payload),
+      listAgentPresets: async () => ({ ...await ctx.agentPresets.remoteExportList(), defaultAgentPreset: ctx.agentPresets.defaultId }),
+    });
+  } catch (e) {
+    registerRpc(ctx, async () => ({ ok: false, error: { code: 'batch/runtime', message: e.message, details: {} } }));
     return;
   }
-  const store = new Store(join(runtime.home, 'batch-tasks'));
-  const queue = new BatchQueue(store, (task, settings, update) => createSdkWorker(runtime, task, settings, update), async settings => {
-    await prepareProfile(runtime, settings);
-    await ctx.agentPresets.resolveMountable(settings.agentPreset);
-  });
-  await queue.init();
-  ctx.effect(() => () => queue.dispose(), 'batch-tasks: queue and isolated SDK workers');
+  ctx.effect(() => () => core.dispose(), 'batch-tasks: owned queue and isolated workers');
   registerRpc(ctx, async (method, payload) => {
-    try {
-      let value;
-      switch (method) {
-        case 'snapshot': value = queue.snapshot(); break;
-        case 'defaults': {
-          const roster = await ctx.agentPresets.remoteExportList();
-          value = { cwd: '', ...ctx.agentDefaultModel.currentSelection(), profile: 'batch-sdk', harnessVersion: runtime.version, home: runtime.home, presets: roster.presets, defaultAgentPreset: ctx.agentPresets.defaultId };
-          break;
-        }
-        case 'start': value = await queue.create(payload); break;
-        case 'pause': value = await queue.pause(); break;
-        case 'resume': value = await queue.resume(); break;
-        case 'concurrency': value = await queue.setConcurrency(payload?.value); break;
-        case 'clear': value = await queue.clear(); break;
-        case 'stopAll': value = await queue.stopAll(false); break;
-        case 'forceAll': value = await queue.stopAll(true); break;
-        case 'stopOne': value = await queue.stopOne(payload?.id, false); break;
-        case 'forceOne': value = await queue.stopOne(payload?.id, true); break;
-        default: throw new Error('未知的批量任务操作');
+    const reply = await core.handle(method, payload);
+    if (method === 'defaults' && reply.ok) {
+      try { Object.assign(reply.value, ctx.agentDefaultModel.currentSelection()); }
+      catch (e) {
+        core.log.warn('model defaults unavailable', { message: e?.message || String(e) });
+        return { ok: false, error: { code: 'batch/model-defaults', message: `读取 DSH 模型设置失败：${e?.message || String(e)}`, details: {} } };
       }
-      return { ok: true, value };
-    } catch (e) { return { ok: false, error: { code: 'batch/operation-failed', message: e.message, details: {} } }; }
+    }
+    return reply;
   });
 }
