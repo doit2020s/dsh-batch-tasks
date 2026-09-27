@@ -37,6 +37,32 @@ test('diagnostic write failure cannot escape RPC error handling', async () => {
     assert.equal((await core.handle('snapshot')).ok, true);
   } finally { await core.dispose(); }
 });
+test('startup republishes an existing SDK listing without dispatching or changing its result', async () => {
+  const config = await fixture();
+  await mkdir(join(config.dshHome, 'batch-tasks'), { recursive: true });
+  const task = { id: 'task-existing', sessionId: 'session-existing', status: 'succeeded', prompt: '你好',
+    result: '你好', groupingVersion: 2, startedAt: 123, workspaceRoot: 'batch-root', workspaceListingPending: true };
+  await writeFile(join(config.dshHome, 'batch-tasks', 'queue.json'), JSON.stringify({ schema: 1, id: 'batch-existing', mode: 'finished', tasks: [task], config: { cwd: 'batch-root' } }));
+  const calls = [];
+  const core = await createBatchCore(config, {
+    async attachSession(payload) { calls.push(payload); return { workspaceId: 'root-workspace', listingReady: true }; },
+  });
+  try {
+    for (let attempt = 0; attempt < 100 && !core.queue.state.tasks[0].workspaceListingRevision; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0], { cwd: 'batch-root', sessionId: 'session-existing', title: 'batch-root', requireStarted: false });
+    const existing = core.queue.snapshot().tasks[0];
+    assert.equal(existing.sessionId, task.sessionId);
+    assert.equal(existing.status, task.status);
+    assert.equal(existing.result, task.result);
+    assert.equal(existing.workspaceListingReady, true);
+    assert.equal(existing.workspaceListingRevision, 1);
+    assert.equal(existing.workspaceListingPending, false);
+    assert.equal(core.queue.live.size, 0, 'Restoring a list must never start SDK execution');
+  } finally { await core.dispose(); }
+});
 
 test('Host model defaults exception stays inside the RPC response envelope', async () => {
   const routes = new Map();

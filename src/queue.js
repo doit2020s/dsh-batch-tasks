@@ -33,6 +33,8 @@ export class BatchQueue {
       await this.store.acquire();
       this.state = await this.store.load() ?? fresh();
       Object.assign(this.state, keepPrefs(this.state));
+      // Publication jobs belong to the previous Host and are never resumed.
+      for (const task of this.state.tasks) delete task.workspaceListingPending;
       for (const task of this.state.tasks) if (ACTIVE.has(task.status)) {
         task.status = 'interrupted'; task.endedAt = Date.now(); task.error = '服务曾退出，执行结果未确认；不会自动重发。';
       }
@@ -315,6 +317,35 @@ export class BatchQueue {
   dispatchSlots() {
     if (!this.state.config) return 0;
     return this.state.config.serialDispatch === false ? this.state.config.concurrency : 1;
+  }
+  /** Only the Host bridge can publish listing metadata; workers cannot set it. */
+  markWorkspaceListingPending(taskId, pending) {
+    if (this.closed || !this.initialized) return;
+    const task = this.state.tasks.find(item => item.id === taskId);
+    if (!task) return;
+    task.workspaceListingPending = pending;
+    this.revision++;
+  }
+  updateWorkspaceListing(taskId, publication, pendingState) {
+    const result = this.operation.then(async () => {
+      if (this.closed || !this.initialized) return false;
+      const task = this.state.tasks.find(item => item.id === taskId);
+      if (!task) return false;
+      if (publication.error) {
+        task.workspaceAttachError = String(publication.error).slice(0, 1000);
+      } else {
+        task.workspaceId = String(publication.workspaceId);
+        task.workspaceAttached = true;
+        task.workspaceListingReady = publication.listingReady === true;
+        if (task.workspaceListingReady) task.workspaceListingRevision = (task.workspaceListingRevision || 0) + 1;
+        delete task.workspaceAttachError;
+      }
+      if (typeof pendingState === 'function') task.workspaceListingPending = !!pendingState();
+      await this.save();
+      return true;
+    });
+    this.operation = result.catch(() => {});
+    return result;
   }
   async settle(task, result) {
     if (result.status === 'unconfirmed') {

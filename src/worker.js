@@ -168,7 +168,10 @@ export function createSdkWorker(runtime, task, config, notify, options = {}) {
       return;
     }
     bump();
-    if (event?.type === 'turn/start') { sawTurn = true; completedReason = null; rootIdle = false; }
+    if (event?.type === 'turn/start') {
+      sawTurn = true; completedReason = null; rootIdle = false;
+      notify({ sessionStarted: true, sessionId: task.sessionId, cwd: task.workspaceRoot || config.cwd });
+    }
     if (event?.type === 'assistant/message') {
       const text = event.data?.message?.content?.filter(x => x.type === 'text').map(x => x.text).join('') || '';
       if (text) { result = text.slice(-100000); notify({ result, activity: '正在执行' }); }

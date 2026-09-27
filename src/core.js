@@ -35,21 +35,53 @@ export async function createBatchCore(config = {}, integration = {}) {
   try { pluginVersion = JSON.parse(readFileSync(join(pathDirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8')).version; } catch {}
   log.info('batch core', { pluginVersion, dshBin: runtime.dshBin, nodePath: runtime.nodePath, home: runtime.home, harnessVersion: runtime.version, integrated: Boolean(integration.attachSession) });
   const attachments = new Set();
-  const queue = new BatchQueue(store, (task, settings, update) => createSdkWorker(runtime, task, settings, event => {
-    if (event?.sessionCreated) {
-      const cwd = event.cwd || task.workspaceRoot || settings.cwd;
-      if (integration.attachSession) {
-        const attached = Promise.resolve().then(() => integration.attachSession({ cwd, sessionId: event.sessionId, title: basename(cwd || '') })).then(() => {
-          log.info('workspace attached', { sessionId: event.sessionId, cwd });
-        }, e => {
-          log.warn('workspace attach failed', { sessionId: event.sessionId, message: errorMessage(e) });
-          update({ activity: `会话列表接入失败：${errorMessage(e)}` });
-        }).finally(() => attachments.delete(attached));
-        attachments.add(attached);
+  const attachmentTails = new Map();
+  const pendingPublications = new Map();
+  function publishSession(task, settings, requireStarted, startupBarrier = Promise.resolve()) {
+    if (!integration.attachSession) return;
+    const cwd = task.workspaceRoot || settings.cwd;
+    pendingPublications.set(task.id, (pendingPublications.get(task.id) || 0) + 1);
+    queue.markWorkspaceListingPending(task.id, true);
+    // A slow creation read must never overwrite the newer nonblank checkpoint.
+    const previous = attachmentTails.get(task.id) || Promise.resolve();
+    const attached = previous.catch(() => {}).then(() => startupBarrier).then(async () => {
+      if (queue.closed) return;
+      try {
+        const publication = await integration.attachSession({ cwd, sessionId: task.sessionId, title: basename(cwd || ''), requireStarted });
+        await queue.updateWorkspaceListing(task.id, publication, () => (pendingPublications.get(task.id) || 1) > 1);
+        log.info('workspace attached', { sessionId: task.sessionId, cwd, listingReady: publication.listingReady, asOfSeq: publication.asOfSeq });
+      } catch (e) {
+        log.warn('workspace attach failed', { sessionId: task.sessionId, message: errorMessage(e) });
+        await queue.updateWorkspaceListing(task.id, { error: errorMessage(e) }, () => (pendingPublications.get(task.id) || 1) > 1);
       }
-    }
-    update(event);
-  }, { log: log.task(task.id) }), async settings => {
+    }).finally(() => {
+      attachments.delete(attached);
+      if (attachmentTails.get(task.id) === attached) attachmentTails.delete(task.id);
+      const remaining = (pendingPublications.get(task.id) || 1) - 1;
+      if (remaining) pendingPublications.set(task.id, remaining);
+      else pendingPublications.delete(task.id);
+      queue.markWorkspaceListingPending(task.id, remaining > 0);
+    });
+    attachmentTails.set(task.id, attached);
+    attachments.add(attached);
+    // Persistence failures remain visible without an unhandled rejection.
+    void attached.catch(e => log.warn('workspace publication save failed', { sessionId: task.sessionId, message: errorMessage(e) }));
+    return attached;
+  }
+  const queue = new BatchQueue(store, (task, settings, update) => {
+    let created = false, started = false;
+    const worker = createSdkWorker(runtime, task, settings, event => {
+      if (event?.sessionCreated) { created = true; publishSession(task, settings, false); }
+      if (event?.sessionStarted) { started = true; publishSession(task, settings, true); }
+      update(event);
+    }, { log: log.task(task.id) });
+    // The final durable checkpoint may arrive after the queue's status changes.
+    const finalPublication = worker.done.then(() => { if (created) return publishSession(task, settings, started); });
+    attachments.add(finalPublication);
+    void finalPublication.catch(e => log.warn('final workspace publication failed', { sessionId: task.sessionId, message: errorMessage(e) }))
+      .finally(() => attachments.delete(finalPublication));
+    return worker;
+  }, async settings => {
     log.info('preflight', { cwd: settings.cwd, profile: settings.profile, agentPreset: settings.agentPreset, provider: settings.provider, model: settings.model });
     await prepareProfile(runtime, settings, log);
     const preset = (await readRoster()).presets.find(row => row.id === settings.agentPreset);
@@ -62,6 +94,17 @@ export async function createBatchCore(config = {}, integration = {}) {
   catch (e) {
     log.error('queue init failed', { message: errorMessage(e), stack: e?.stack });
     startupError = errorMessage(e);
+  }
+  if (initialized && integration.attachSession) {
+    // Refresh prior SDK sessions through the Host; this never replays a task.
+    const lanes = Array.from({ length: 4 }, () => Promise.resolve());
+    let cursor = 0;
+    for (const task of queue.state.tasks) {
+      if (task.groupingVersion === 2 && task.startedAt && task.workspaceRoot && task.status !== 'pending') {
+        const lane = cursor++ % lanes.length;
+        lanes[lane] = publishSession(task, queue.state.config || { cwd: queue.state.batchRoot }, false, lanes[lane]).catch(() => {});
+      }
+    }
   }
   async function handle(method, payload = {}) {
     if (startupError && method !== 'defaults') {

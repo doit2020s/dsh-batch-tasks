@@ -183,6 +183,107 @@ test('Host warms worker title projections through read-only persistence before p
   assert.equal(cacheReads, 2);
 });
 
+test('started publication rereads durable history and closes each handle before publishing a nonblank session', async () => {
+  const host = hostFixture(); host.headers.set('greeting', { cwd: 'batch-root' });
+  const header = { id: 'greeting', cwd: 'batch-root', createdAt: 123 };
+  const titleOnly = [{ seq: 0, type: 'session/title', data: { title: '你好' } }];
+  const started = [...titleOnly, { seq: 1, time: 124, type: 'turn/start', data: { turn: 1 } }];
+  let opens = 0, warmed = 0;
+  const closed = [];
+  let cached = { asOfSeq: 0, values: { title: '你好', sessionListMetadata: { blank: true, lastPromptAt: null } } };
+  const ctx = {
+    workspaceRegistry: { async create(...args) {
+      assert.equal(cached.values.sessionListMetadata.blank, false, 'Registry membership was published from the create-only blank cache');
+      assert.deepEqual(closed, [1, 2, 3], 'Every old read snapshot must be closed before publication');
+      return host.registry.create(...args);
+    } },
+    sessionPersistence: { async open(id, access) {
+      assert.equal(id, 'greeting'); assert.equal(access, 'read');
+      const attempt = ++opens;
+      const events = attempt < 3 ? titleOnly : started;
+      return { header, inheritedEventCount: 0,
+        async read(offset) { assert.equal(offset, 0); return { events }; },
+        async close() { closed.push(attempt); },
+      };
+    } },
+    sessionProjectionCache: { cachedSnapshot(meta, inherited, keys) {
+      assert.equal(meta, header); assert.equal(inherited, 0);
+      assert.deepEqual(keys, ['title', 'sessionListMetadata']);
+      return cached;
+    } },
+  };
+  const attached = await attachWithHost(ctx, { cwd: 'batch-root', sessionId: 'greeting', requireStarted: true }, {
+    delayMs: 0, attempts: 3,
+    async warmListingCache(_ctx, _header, _inherited, events) {
+      warmed++;
+      assert.equal(events, started, 'Uncommitted turn/start must not create a misleading published checkpoint');
+      cached = { asOfSeq: 1, values: { title: '你好', sessionListMetadata: { blank: false, lastPromptAt: null } } };
+      return cached;
+    },
+  });
+  assert.equal(opens, 3); assert.equal(warmed, 1);
+  assert.deepEqual(closed, [1, 2, 3]);
+  assert.equal(attached.listingReady, true); assert.equal(attached.asOfSeq, 1);
+  assert.deepEqual(host.records.get('batch-root').sessionIds, ['greeting']);
+  assert.equal(host.changes.length, 1);
+});
+
+test('unchanged title cannot publish until the delayed nonblank metadata column reaches the Host cache', async () => {
+  const host = hostFixture(); host.headers.set('greeting', { cwd: 'batch-root' });
+  const header = { id: 'greeting', cwd: 'batch-root', createdAt: 123 };
+  const events = [{ seq: 0, type: 'session/title', data: { title: '你好' } }, { seq: 1, type: 'turn/start', data: { turn: 1 } }];
+  const oldCache = { asOfSeq: 0, values: { title: '你好', sessionListMetadata: { blank: true, lastPromptAt: null } } };
+  const newCache = { asOfSeq: 1, values: { title: '你好', sessionListMetadata: { blank: false, lastPromptAt: null } } };
+  let cached = oldCache, cacheReads = 0, closes = 0;
+  const ctx = {
+    workspaceRegistry: { async create(...args) {
+      assert.equal(cached.values.title, oldCache.values.title, 'The scenario must keep the same title');
+      assert.equal(cached.values.sessionListMetadata.blank, false, 'Matching title alone cannot establish sidebar visibility');
+      assert.equal(closes, 1);
+      return host.registry.create(...args);
+    } },
+    sessionPersistence: { async open(_id, access) {
+      assert.equal(access, 'read');
+      return { header, inheritedEventCount: 0, async read() { return { events }; }, async close() { closes++; } };
+    } },
+    sessionProjectionCache: { cachedSnapshot(_header, _inherited, keys) {
+      assert.deepEqual(keys, ['title', 'sessionListMetadata']);
+      if (++cacheReads === 2) cached = newCache;
+      return cached;
+    } },
+  };
+  const attached = await attachWithHost(ctx, { cwd: 'batch-root', sessionId: 'greeting', requireStarted: true }, {
+    delayMs: 0, cacheAttempts: 2,
+    async warmListingCache() { return newCache; },
+  });
+  assert.equal(cacheReads, 2, 'Publication skipped waiting for the metadata column');
+  assert.equal(attached.listingReady, true);
+  assert.equal(attached.asOfSeq, 1);
+  assert.deepEqual(host.records.get('batch-root').sessionIds, ['greeting']);
+});
+
+test('missing durable turn/start exhausts bounded retries without registering or disguising a blank session', async () => {
+  const host = hostFixture(); host.headers.set('greeting', { cwd: 'batch-root' });
+  let opens = 0, closes = 0, warmed = 0;
+  const ctx = {
+    workspaceRegistry: host.registry,
+    sessionPersistence: { async open(_id, access) {
+      assert.equal(access, 'read'); opens++;
+      return { header: { id: 'greeting' }, inheritedEventCount: 0,
+        async read() { return { events: [{ seq: 0, type: 'session/title', data: { title: '你好' } }] }; },
+        async close() { closes++; },
+      };
+    } },
+    sessionProjectionCache: { cachedSnapshot() { assert.fail('A create-only snapshot cannot be published as started'); } },
+  };
+  await assert.rejects(attachWithHost(ctx, { cwd: 'batch-root', sessionId: 'greeting', requireStarted: true }, {
+    delayMs: 0, attempts: 3, async warmListingCache() { warmed++; return { values: {} }; },
+  }), error => error.name === 'SessionListingNotPublishedError' && /开始事件尚未落盘/.test(error.message));
+  assert.equal(opens, 3); assert.equal(closes, 3); assert.equal(warmed, 0);
+  assert.equal(host.records.size, 0);
+  assert.deepEqual(host.changes, []);
+});
+
 test('projection warming closes read handles on errors without hiding storage faults', async () => {
   let closed = false;
   const ctx = {

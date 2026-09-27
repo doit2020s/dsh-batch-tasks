@@ -109,7 +109,7 @@ try {
     const records = await workspaceRecords();
     const list = await sessionList();
     assert.equal(list.ok, true, JSON.stringify(list));
-    return started.some(task => records.some(w => w.path === realpathSync.native(root) && w.sessionIds.includes(task.sessionId)) && list.value.items.some(s => s.sessionId === task.sessionId));
+    return started.some(task => records.some(w => w.path === realpathSync.native(root) && w.sessionIds.includes(task.sessionId)) && list.value.items.some(s => s.sessionId === task.sessionId && s.blank === false));
   });
   assert.equal(await page.getByRole('button', { name: '清空列表', exact: true }).isDisabled(), true);
   await page.waitForTimeout(1500); await page.screenshot({ path: 'artifacts/panel-running.png', fullPage: true });
@@ -134,7 +134,7 @@ try {
     const list = await sessionList();
     assert.equal(list.ok, true, JSON.stringify(list));
     await writeFile('artifacts/ui-final-visibility-debug.json', JSON.stringify({ tasks: firstBatch.tasks, records, list }, null, 2));
-    return records.length === 1 && firstBatch.tasks.every(task => records.some(w => w.path === realpathSync.native(root) && w.sessionIds.includes(task.sessionId)) && list.value.items.some(s => s.sessionId === task.sessionId && realpathSync.native(s.cwd) === realpathSync.native(root)));
+    return records.length === 1 && firstBatch.tasks.every(task => records.some(w => w.path === realpathSync.native(root) && w.sessionIds.includes(task.sessionId)) && list.value.items.some(s => s.sessionId === task.sessionId && s.blank === false && realpathSync.native(s.cwd) === realpathSync.native(root)));
   });
   const registered = await workspaceRecords();
   assert.equal(registered.length, 1, 'Task subdirectories became extra workspaces');

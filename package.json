@@ -1,6 +1,6 @@
 {
   "name": "dsh-batch-tasks",
-  "version": "0.1.36",
+  "version": "0.1.37",
   "description": "DeepSeek Harness 原生批量任务插件：选择 Agent、独立任务目录、SDK 会话投递与停止管理",
   "type": "module",
   "license": "MIT",

@@ -236,7 +236,7 @@ export function Panel({ call, onClose, onOpenSession, initialCwd = '' }) {
       <div className="dbt-toolbar"><div>{state?.mode === 'paused' ? <button disabled={busy || !state?.config?.agentPreset} onClick={() => action('resume')}>继续投递</button> : <button disabled={busy || state?.mode !== 'running'} onClick={() => action('pause')}>暂停投递</button>}<button disabled={stopBusy || !canStop} onClick={confirmStopAll}>停止全部</button></div><button className="dbt-danger" disabled={stopBusy || !state?.liveCount} onClick={() => setConfirmation({ method: 'forceAll', title: '立即强制中断全部？', text: '立即结束本批次的任务进程及其普通子进程；未落盘输出可能不完整。不会结束其他 DSH 会话。' })}>强制中断全部</button></div>
 
       <div className="dbt-filters">{[['all', '全部'], ['active', '运行中'], ['pending', '待投递'], ['succeeded', '已完成'], ['failed', '异常']].map(([key, label]) => <button key={key} className={filter === key ? 'selected' : ''} onClick={() => setFilter(key)}>{label}</button>)}</div>
-      <div className="dbt-list">{shown.length ? shown.map(t => <div key={t.id} className={`dbt-task ${selected === t.id ? 'chosen' : ''}`}><button className="dbt-task-main" onClick={() => setSelected(selected === t.id ? null : t.id)}><span className="dbt-line">{String(t.line).padStart(3, '0')}</span><span className="dbt-task-text">{t.prompt}<small className={t.error ? 'dbt-task-error' : undefined}>{t.error || t.activity || (t.status === 'pending' ? '等待空闲会话' : t.sessionId)}</small>{t.source && t.source !== t.prompt && <small className="dbt-task-source">原文：{t.source}</small>}{(t.workDir || state?.config?.cwd) && <small className="dbt-task-directory" title={t.workDir || state.config.cwd}>{t.workDir ? '任务目录' : '旧批次目录'}：{t.workDir || state.config.cwd}</small>}</span><span className={`dbt-badge ${t.status}`}>{labels[t.status]}</span></button>{busyStatuses.includes(t.status) && <button className="dbt-stop-one" aria-label={`停止第 ${t.line} 行`} disabled={stopBusy} onClick={() => action('stopOne', { id: t.id })}>停止</button>}</div>) : <div className="dbt-empty"><div>☷</div><h3>{tasks.length ? '此分类没有任务' : '队列准备就绪'}</h3><p>{tasks.length ? '可切换其他分类查看。' : '导入文本或粘贴任务，设置并发数量后开始。'}</p></div>}</div>
+      <div className="dbt-list">{shown.length ? shown.map(t => <div key={t.id} className={`dbt-task ${selected === t.id ? 'chosen' : ''}`}><button className="dbt-task-main" onClick={() => setSelected(selected === t.id ? null : t.id)}><span className="dbt-line">{String(t.line).padStart(3, '0')}</span><span className="dbt-task-text">{t.prompt}<small className={t.error || t.workspaceAttachError ? 'dbt-task-error' : undefined}>{t.error || (t.workspaceAttachError && '会话列表接入失败：' + t.workspaceAttachError) || t.activity || (t.status === 'pending' ? '等待空闲会话' : t.sessionId)}</small>{t.source && t.source !== t.prompt && <small className="dbt-task-source">原文：{t.source}</small>}{(t.workDir || state?.config?.cwd) && <small className="dbt-task-directory" title={t.workDir || state.config.cwd}>{t.workDir ? '任务目录' : '旧批次目录'}：{t.workDir || state.config.cwd}</small>}</span><span className={`dbt-badge ${t.status}`}>{labels[t.status]}</span></button>{busyStatuses.includes(t.status) && <button className="dbt-stop-one" aria-label={`停止第 ${t.line} 行`} disabled={stopBusy} onClick={() => action('stopOne', { id: t.id })}>停止</button>}</div>) : <div className="dbt-empty"><div>☷</div><h3>{tasks.length ? '此分类没有任务' : '队列准备就绪'}</h3><p>{tasks.length ? '可切换其他分类查看。' : '导入文本或粘贴任务，设置并发数量后开始。'}</p></div>}</div>
       {detail && <aside className="dbt-detail"><div className="dbt-card-title"><h3>第 {detail.line} 行 · {labels[detail.status]}</h3><button onClick={() => setSelected(null)}>收起</button></div><div className="dbt-session-id">会话 ID：<code>{detail.sessionId}</code>{onOpenSession && ['succeeded', 'failed'].includes(detail.status) && <button type="button" disabled={openingSession} onClick={() => void openSession(detail.sessionId)}>{openingSession ? '打开中…' : '打开会话'}</button>}</div><div className="dbt-agent-detail">Agent 预设：<code>{detailAgentPreset ? presetLabel(detailAgentPreset) : '未指定（旧批次）'}</code></div>{detailWorkDir && <div className="dbt-directory-detail"><span>{detail.workDir ? '任务工作目录' : '旧批次共用工作目录'}</span><code title={detailWorkDir}>{detailWorkDir}</code><button type="button" onClick={() => void copyTaskDirectory(detailWorkDir)}>{copiedPath === detailWorkDir ? '已复制' : '复制路径'}</button></div>}<p>{detail.prompt}</p>{detail.error && <p className="dbt-error">{detail.error}</p>}<pre>{detail.result || '尚无文本结果。会话完整记录由 DSH 保存。'}</pre>{busyStatuses.includes(detail.status) && <button className="dbt-danger" onClick={() => setConfirmation({ method: 'forceOne', payload: { id: detail.id }, title: '强制中断这条任务？', text: '仅结束该任务的执行进程，保留已有记录。' })}>强制中断此任务</button>}</aside>}
     </section></div>
 
@@ -258,7 +258,7 @@ export function apply(ctx) {
     if (!Array.isArray(snapshot?.tasks)) return '';
     return snapshot.tasks
       .filter(task => task.sessionId && ['running', 'stopping', 'succeeded', 'failed', 'cancelled', 'killed', 'interrupted', 'unconfirmed'].includes(task.status))
-      .map(task => `${task.sessionId}:${task.status}`).join('|');
+      .map(task => `${task.sessionId}:${task.status}:${task.workspaceListingRevision || 0}`).join('|');
   }
   async function refreshSessionListWhenChanged() {
     if (sessionRefreshInFlight) return;
@@ -280,7 +280,8 @@ export function apply(ctx) {
   function noteSnapshot(snapshot) {
     latestSnapshot = snapshot;
     void refreshSessionListWhenChanged();
-    const active = snapshot?.mode === 'running' || Number(snapshot?.liveCount) > 0;
+    const active = snapshot?.mode === 'running' || Number(snapshot?.liveCount) > 0
+      || snapshot?.tasks?.some(task => task.workspaceListingPending);
     if (active && !backgroundTimer) {
       backgroundTimer = setInterval(async () => {
         if (openPanels || backgroundPollInFlight) return;
@@ -328,4 +329,6 @@ export function apply(ctx) {
   ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'batch-tasks', order: 70, label: () => '批量任务' }, SettingsPanel));
   ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({ name: 'conversation.session.header.actions', id: 'batch-tasks', order: 35 }, HeaderAction));
   ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({ name: 'sidebar.footer.action', id: 'batch-tasks', order: 35 }, SidebarAction));
+  // Observe restored publication jobs even when the user never opens the panel.
+  void call('snapshot').catch(() => {});
 }

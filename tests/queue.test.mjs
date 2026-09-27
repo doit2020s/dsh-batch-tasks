@@ -47,6 +47,39 @@ test('batch root and concurrency persist across clear', async () => {
   assert.equal(cleared.concurrency, 4);
   await queue.dispose();
 });
+test('workspace publication persists independently of task completion and cannot resurrect a cleared task', async () => {
+  const { queue, workers, directory } = await harness();
+  try {
+    await queue.create(input(1));
+    await until(() => workers.length === 1);
+    const task = workers[0].task;
+    await queue.updateWorkspaceListing(task.id, { error: 'listing storage unavailable' });
+    workers[0].finish({ status: 'succeeded', result: '5' });
+    await until(() => task.status === 'succeeded' && queue.state.mode === 'finished');
+    assert.equal(task.workspaceAttachError, 'listing storage unavailable');
+    assert.equal(task.activity, '');
+    let releaseOperation;
+    queue.markWorkspaceListingPending(task.id, true);
+    const blocked = new Promise(resolve => { releaseOperation = resolve; });
+    queue.operation = queue.operation.then(() => blocked);
+    const publication = queue.updateWorkspaceListing(task.id, { workspaceId: 'root-workspace', listingReady: true }, () => false);
+    await tick();
+    assert.equal(task.workspaceListingPending, true, 'Blocked publication cleared pending before its revision');
+    assert.equal(task.workspaceListingRevision, undefined);
+    releaseOperation(); await publication;
+    assert.equal(task.workspaceListingPending, false);
+    const saved = JSON.parse(await readFile(join(directory, 'queue.json'), 'utf8'));
+    assert.equal(saved.tasks[0].status, 'succeeded');
+    assert.equal(saved.tasks[0].result, '5');
+    assert.equal(saved.tasks[0].workspaceId, 'root-workspace');
+    assert.equal(saved.tasks[0].workspaceListingReady, true);
+    assert.equal(saved.tasks[0].workspaceListingRevision, 1);
+    assert.equal(saved.tasks[0].workspaceAttachError, undefined);
+    await queue.clear();
+    assert.equal(await queue.updateWorkspaceListing(task.id, { workspaceId: 'root-workspace', listingReady: true }), false);
+    assert.deepEqual(queue.state.tasks, []);
+  } finally { await queue.dispose(); }
+});
 test('prefix and suffix persist across start, clear and reopen', async () => {
   const { queue, workers, store, directory } = await harness();
   await queue.setAffix({ taskPrefix: '对站点 ', taskSuffix: ' 做独立站测试' });
